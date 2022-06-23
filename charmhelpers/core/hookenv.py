@@ -1338,6 +1338,7 @@ def atexit(callback, *args, **kwargs):
     '''Schedule a callback to run on successful hook completion.
 
     Callbacks are run in the reverse order that they were added.'''
+    global _atexit
     _atexit.append((callback, args, kwargs))
 
 
