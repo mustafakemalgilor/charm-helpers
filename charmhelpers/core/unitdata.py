@@ -147,6 +147,7 @@ associated to the hookname.
 """
 
 import collections
+import collections.abc
 import contextlib
 import datetime
 import itertools
@@ -271,12 +272,13 @@ class Storage(object):
                     'insert into kv_revisions values (?, ?, ?)',
                     ['%s%%' % prefix, self.revision, json.dumps('DELETED')])
 
-    def set(self, key, value):
+    def set(self, key, value, delta_revisions=False):
         """
         Set a value in the database.
 
         :param str key: Key to set the value for
         :param value: Any JSON-serializable value to be set
+        :param delta_revisions: Only keep delta of the changes as revision
         """
         serialized = json.dumps(value)
 
@@ -302,6 +304,21 @@ class Storage(object):
         if not self.revision:
             return value
 
+        serialized_revision = serialized
+        if delta_revisions:
+            # Delta revisions is only available for Mapping
+            # types at the moment.
+            if isinstance(value, collections.abc.Mapping):
+                # If the invocation opted in for delta-revisions
+                # only the delta between current and new will be
+                # serialized and pushed as a revision.
+                # This is for keeping a low footprint on disk space
+                current = None
+                if exists:
+                    current = json.loads(exists[0])
+                delta = self.mapping_delta(value, current)
+                serialized_revision = json.dumps(delta)
+
         self.cursor.execute(
             'select 1 from kv_revisions where key=? and revision=?',
             [key, self.revision])
@@ -311,7 +328,7 @@ class Storage(object):
             self.cursor.execute(
                 '''insert into kv_revisions (
                 revision, key, data) values (?, ?, ?)''',
-                (self.revision, key, serialized))
+                (self.revision, key, serialized_revision))
         else:
             self.cursor.execute(
                 '''
@@ -319,38 +336,51 @@ class Storage(object):
                 set data = ?
                 where key = ?
                 and   revision = ?''',
-                [serialized, key, self.revision])
+                [serialized_revision, key, self.revision])
 
         return value
+
+    def mapping_delta(self, current_mapping, previous_mapping):
+        """
+        return the difference between two Mapping objects.
+        """
+        delta = DeltaSet()
+        previous_keys = set()
+        current_keys = set()
+        if previous_mapping:
+            previous_keys = set(previous_mapping.keys())
+        else:
+            previous_mapping = dict()
+
+        if current_mapping:
+            current_keys = set(current_mapping.keys())
+        else:
+            current_mapping = dict()
+
+        # Added
+        for k in current_keys.difference(previous_keys):
+            delta[k] = Delta(None, current_mapping[k])
+
+        # Removed
+        for k in previous_keys.difference(current_keys):
+            delta[k] = Delta(previous_mapping[k], None)
+
+        # Changed
+        for k in previous_keys.intersection(current_keys):
+            c = current_mapping[k]
+            p = previous_mapping[k]
+            if c != p:
+                delta[k] = Delta(p, c)
+
+        return delta
 
     def delta(self, mapping, prefix):
         """
         return a delta containing values that have changed.
         """
         previous = self.getrange(prefix, strip=True)
-        if not previous:
-            pk = set()
-        else:
-            pk = set(previous.keys())
-        ck = set(mapping.keys())
-        delta = DeltaSet()
 
-        # added
-        for k in ck.difference(pk):
-            delta[k] = Delta(None, mapping[k])
-
-        # removed
-        for k in pk.difference(ck):
-            delta[k] = Delta(previous[k], None)
-
-        # changed
-        for k in pk.intersection(ck):
-            c = mapping[k]
-            p = previous[k]
-            if c != p:
-                delta[k] = Delta(p, c)
-
-        return delta
+        return self.mapping_delta(mapping, previous)
 
     @contextlib.contextmanager
     def hook_scope(self, name=""):
@@ -491,7 +521,25 @@ class HookData(object):
         data = hookenv.execution_environment()
         self.conf = conf_delta = self.kv.delta(data['conf'], 'config')
         self.rels = rels_delta = self.kv.delta(data['rels'], 'rels')
-        self.kv.set('env', dict(data['env']))
+
+        # NOTE(mustafakemalgilor): The environment variable revisions were
+        # originally kept as a whole. That has caused disk space issues on
+        # some deployments where the size of environment variable list were
+        # large. This should not been an issue if the environment variable
+        # list were stable, but some of the environment variables (e.g.
+        # JUJU_CONTEXT_ID) are always changing. I've seen some deployments
+        # with environment variable lists ~70 KiB in size. Considering the
+        # fact that the record_hook function is being called on each hook
+        # invocation, it is no surprise that the unit-state database file
+        # grows with time. To give a more concrete example, even if only
+        # update-status hook is being called for a charm, that means at
+        # least 70 KiB of data is being pushed into kv_relations table every
+        # five minutes which is roughly equivalent to 7 GiB of kv_relations
+        # history in a year -- not to mention this is valid for every single
+        # charm. Multiple charms performing this in same environment over
+        # extended periods of time is enough to fill the storage space quickly.
+
+        self.kv.set('env', dict(data['env']), delta_revisions=True)
         self.kv.set('unit', data['unit'])
         self.kv.set('relid', data.get('relid'))
         return conf_delta, rels_delta

@@ -17,15 +17,15 @@ import unittest
 
 from mock import patch
 
-from charmhelpers.core.unitdata import Storage, HookData, kv
+from charmhelpers.core.unitdata import Storage, HookData
 
 
 class HookDataTest(unittest.TestCase):
-
     def setUp(self):
         self.charm_dir = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(self.charm_dir))
         self.change_environment(CHARM_DIR=self.charm_dir)
+        self.kv = Storage()
 
     def change_environment(self, **kw):
         original_env = dict(os.environ)
@@ -40,21 +40,66 @@ class HookDataTest(unittest.TestCase):
     @patch('charmhelpers.core.hookenv.hook_name')
     @patch('charmhelpers.core.hookenv.execution_environment')
     @patch('charmhelpers.core.hookenv.charm_dir')
-    def test_hook_data_records(self, cdir, ctx, name):
+    @patch('charmhelpers.core.unitdata.kv')
+    def test_hook_data_records(self, kv, cdir, ctx, name):
+        kv.return_value = self.kv
+        hook_data = HookData()
         name.return_value = 'config-changed'
         ctx.return_value = {
             'rels': {}, 'conf': {'a': 1}, 'env': {}, 'unit': 'someunit'}
         cdir.return_value = self.charm_dir
         with open(os.path.join(self.charm_dir, 'revision'), 'w') as fh:
             fh.write('1')
-        hook_data = HookData()
 
         with hook_data():
-            self.assertEqual(kv(), hook_data.kv)
-            self.assertEqual(kv().get('charm_revisions'), ['1'])
-            self.assertEqual(kv().get('unit'), 'someunit')
+            self.assertEqual(self.kv, hook_data.kv)
+            self.assertEqual(self.kv.get('charm_revisions'), ['1'])
+            self.assertEqual(self.kv.get('unit'), 'someunit')
             self.assertEqual(list(hook_data.conf), ['a'])
             self.assertEqual(tuple(hook_data.conf.a), (None, 1))
+
+    @patch('charmhelpers.core.hookenv.hook_name')
+    @patch('charmhelpers.core.hookenv.execution_environment')
+    @patch('charmhelpers.core.hookenv.charm_dir')
+    @patch('charmhelpers.core.unitdata.kv')
+    def test_hook_data_environment(self, kv, cdir, ctx, name):
+        kv.return_value = self.kv
+        hook_data = HookData()
+        name.return_value = 'config-changed'
+        mock_env = {
+            "SHELL": "/bin/bash",
+            "SESSION_MANAGER": "local/workstation:@/tmp/.ICE-unix/8101,unix/workstation:/tmp/.ICE-unix/8101",
+            "COLORTERM": "truecolor",
+            "LC_ADDRESS": "tr_TR.UTF-8",
+            "LC_NAME": "tr_TR.UTF-8",
+            "DESKTOP_SESSION": "ubuntu",
+            "LC_MONETARY": "tr_TR.UTF-8",
+            "PWD": "/tmp",
+            "XDG_SESSION_DESKTOP": "ubuntu",
+            "LOGNAME": "user",
+            "HOME": "/home/user",
+            "USERNAME": "user",
+            "LC_PAPER": "tr_TR.UTF-8",
+            "LANG": "en_US.UTF-8"
+        }
+
+        mock_env_delta = {}
+        for key in mock_env:
+            mock_env_delta[key] = [None, mock_env[key]]
+
+        ctx.return_value = {
+            'rels': {}, 'conf': {'a': 2}, 'env': mock_env, 'unit': 'someunit'}
+        cdir.return_value = self.charm_dir
+        with open(os.path.join(self.charm_dir, 'revision'), 'w') as fh:
+            fh.write('2')
+
+        self.maxDiff = 50000
+        with hook_data():
+            self.assertEqual(self.kv.get('env'), mock_env)
+
+        history = list(self.kv.gethistory('env', deserialize=True))
+        self.assertEqual(1, len(history))
+        self.assertCountEqual(history[0][2], mock_env_delta)
 
 
 class StorageTest(unittest.TestCase):
@@ -107,6 +152,44 @@ class StorageTest(unittest.TestCase):
             history,
             [(1, 'a', 1, 'config-changed'),
              (2, 'a', True, 'start')])
+
+    def test_hook_scope_delta_revisions(self):
+        kv = Storage(':memory:')
+        with kv.hook_scope('some-hook') as rev:
+            self.assertEqual(rev, 1)
+            kv.set('env', {'ENVVAR1': "DUMMY1", 'ENVVAR2': "DUMMY2"}, delta_revisions=True)
+            kv.set('env', {'ENVVAR1': "DUMMY1_2", 'ENVVAR3': "DUMMY3"}, delta_revisions=True)
+        self.assertEqual(kv.get('env'), {'ENVVAR1': "DUMMY1_2", 'ENVVAR3': "DUMMY3"})
+
+        with kv.hook_scope('some-other-hook') as rev:
+            self.assertEqual(rev, 2)
+            kv.set('env', {'ENVVAR3': "DUMMY3"}, delta_revisions=True)
+        self.assertEqual(kv.get('env'), {'ENVVAR3': "DUMMY3"})
+
+        history = [h[:-1] for h in kv.gethistory('env', deserialize=True)]
+        self.assertEqual(
+            history,
+            [(1, 'env', {"ENVVAR3": [None, "DUMMY3"], "ENVVAR2": ["DUMMY2", None], "ENVVAR1": ["DUMMY1", "DUMMY1_2"]}, 'some-hook'),
+             (2, 'env', {"ENVVAR1": ["DUMMY1_2", None]}, 'some-other-hook')])
+
+    def test_hook_scope_no_delta_revisions(self):
+        kv = Storage(':memory:')
+        with kv.hook_scope('some-hook') as rev:
+            self.assertEqual(rev, 1)
+            kv.set('env', {'ENVVAR1': "DUMMY1", 'ENVVAR2': "DUMMY2"}, delta_revisions=False)
+            kv.set('env', {'ENVVAR1': "DUMMY1_2", 'ENVVAR3': "DUMMY3"}, delta_revisions=False)
+        self.assertEqual(kv.get('env'), {'ENVVAR1': "DUMMY1_2", 'ENVVAR3': "DUMMY3"})
+
+        with kv.hook_scope('some-other-hook') as rev:
+            self.assertEqual(rev, 2)
+            kv.set('env', {'ENVVAR3': "DUMMY3"}, delta_revisions=False)
+        self.assertEqual(kv.get('env'), {'ENVVAR3': "DUMMY3"})
+
+        history = [h[:-1] for h in kv.gethistory('env', deserialize=True)]
+        self.assertEqual(
+            history,
+            [(1, 'env', {"ENVVAR3": "DUMMY3", "ENVVAR1": "DUMMY1_2"}, 'some-hook'),
+             (2, 'env', {"ENVVAR3": "DUMMY3"}, 'some-other-hook')])
 
     def test_delta_no_previous_and_history(self):
         kv = Storage(':memory:')
@@ -176,6 +259,29 @@ class StorageTest(unittest.TestCase):
             pass
         else:
             self.fail('attribute error should fire on nonexistant')
+
+    def test_mapping_delta(self):
+        # Add
+        kv = Storage(':memory:')
+        current_1 = {'a': 0, 'c': False}
+        new_1 = {'a': 0, 'b': "test", 'c': False}
+        delta_1 = kv.mapping_delta(new_1, current_1)
+
+        self.assertFalse(hasattr(delta_1, 'a'))
+        self.assertFalse(hasattr(delta_1, 'c'))
+        self.assertEqual(delta_1.b.previous, None)
+        self.assertEqual(delta_1.b.current, "test")
+
+        current_2 = {'a': 0, 'c': False}
+        new_2 = {'a': 1, 'b': "test"}
+        delta_2 = kv.mapping_delta(new_2, current_2)
+
+        self.assertEqual(delta_2.a.previous, 0)
+        self.assertEqual(delta_2.a.current, 1)
+        self.assertEqual(delta_2.b.previous, None)
+        self.assertEqual(delta_2.b.current, "test")
+        self.assertEqual(delta_2.c.previous, False)
+        self.assertEqual(delta_2.c.current, None)
 
     def test_delta(self):
         kv = Storage(':memory:')
